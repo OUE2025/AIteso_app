@@ -169,9 +169,6 @@ function App() {
   const [toast, setToast] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const [quotaModal, setQuotaModal] = useState(false);
-  const [promptInput, setPromptInput] = useState("");
-  const [promptImage, setPromptImage] = useState("");
-  const [promptLoading, setPromptLoading] = useState(false);
 
   const displayName = useMemo(() => userName.trim() || "あなた", [userName]);
 
@@ -209,34 +206,6 @@ function App() {
     setDropActive(false);
     const [file] = event.dataTransfer.files || [];
     handleImageSelection(file);
-  };
-
-  const generatePromptImage = async () => {
-    const prompt = promptInput.trim();
-    if (!prompt) {
-      showToast("画像の指示テキストを入力してください");
-      return;
-    }
-    setPromptLoading(true);
-    setPromptImage("");
-    try {
-      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&seed=${Date.now()}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error("画像生成に失敗しました");
-      const blob = await res.blob();
-      const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-      setPromptImage(dataUrl);
-    } catch (error) {
-      console.error("Prompt Image Error:", error);
-      showToast(error?.message || "画像生成に失敗しました");
-    } finally {
-      setPromptLoading(false);
-    }
   };
 
 
@@ -435,9 +404,6 @@ function App() {
     setView(VIEWS.INPUT);
     setIsProcessing(false);
     setQuotaModal(false);
-    setPromptInput("");
-    setPromptImage("");
-    setPromptLoading(false);
   };
 
   return (
@@ -560,34 +526,6 @@ function App() {
                 </button>
               </div>
             )}
-          </div>
-          <div className="glass-card p-6 md:p-8 shadow-2xl space-y-4 text-left">
-            <h3 className="text-lg font-bold text-white">Pollinationsで画像生成（テキスト指示）</h3>
-            <p className="text-sm text-slate-300">指示テキストを入力して画像を生成します。（テスト用・後で削除可能）</p>
-            <input
-              type="text"
-              value={promptInput}
-              onChange={(e) => setPromptInput(e.target.value)}
-              placeholder="例: 夜明けの森にいる青い小鳥、映画のようなライティング"
-              className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            />
-            <div className="flex flex-col md:flex-row md:items-center gap-4">
-              <button
-                type="button"
-                onClick={generatePromptImage}
-                disabled={promptLoading}
-                className="px-5 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-white font-bold shadow-lg disabled:opacity-60"
-              >
-                {promptLoading ? "生成中..." : "画像を生成する"}
-              </button>
-              {promptImage && (
-                <img
-                  src={promptImage}
-                  alt="Prompt generated"
-                  className="w-full md:w-48 rounded-xl border border-white/10 shadow-lg"
-                />
-              )}
-            </div>
           </div>
         </section>
       )}
