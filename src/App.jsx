@@ -20,10 +20,19 @@ const VIEWS = {
   RESULT: "result",
 };
 
-const apiKey = import.meta.env.VITE_GOOGLE_API_KEY || "";
+const apiKey = (import.meta.env.VITE_GOOGLE_API_KEY || "").trim();
 
-function renderSafeMarkdown(md) {
-  return md
+const escapeHtml = (str = "") =>
+  str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+function renderSafeMarkdown(md = "") {
+  const safe = escapeHtml(md);
+  return safe
     .replace(/^# (.*$)/gm, '<h2 class="text-2xl font-black mb-4">$1</h2>')
     .replace(/^(\d\.\s\*\*(.*?)\*\*)/gm, "<h3>$2</h3>")
     .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
@@ -72,14 +81,18 @@ function compressAndResizeImage(file) {
   });
 }
 
-async function secureApiCall(payload, endpoint = "generateContent") {
+function ensureApiKey() {
   if (!apiKey) {
     throw new Error("APIキーが設定されていません。VITE_GOOGLE_API_KEY を設定してください。");
   }
+  return apiKey;
+}
 
+async function secureApiCall(payload, endpoint = "generateContent") {
+  const key = ensureApiKey();
   const isPredict = endpoint === "predict";
   const model = isPredict ? CONFIG.imagenModel : CONFIG.geminiModel;
-  const url = `${CONFIG.apiBase}${model}:${endpoint}?key=${apiKey}`;
+  const url = `${CONFIG.apiBase}${model}:${endpoint}?key=${key}`;
 
   let retryCount = 0;
   const maxRetries = 5;
@@ -94,7 +107,22 @@ async function secureApiCall(payload, endpoint = "generateContent") {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || `HTTP ${response.status}`);
+        const rawMessage = errorData.error?.message || `HTTP ${response.status}`;
+        const lower = rawMessage.toLowerCase();
+        const status = response.status;
+        const isQuota =
+          status === 429 ||
+          status === 403 ||
+          lower.includes("quota") ||
+          lower.includes("exceed") ||
+          lower.includes("exhausted") ||
+          lower.includes("insufficient tokens") ||
+          lower.includes("billing") ||
+          lower.includes("daily limit");
+        if (isQuota) {
+          throw new Error("無料枠を使い切ったため、本日はご利用いただけません。明日以降か、課金設定後にお試しください。");
+        }
+        throw new Error(rawMessage);
       }
 
       return await response.json();
@@ -200,6 +228,7 @@ function App() {
       setSpiritState({ status: "idle", img: "", caption: "" });
     } catch (error) {
       console.error("Analysis Error:", error);
+      setAnalysisMarkdown("");
       showToast(error.message || "鑑定に失敗しました。時間をおいて再試行してください。");
       setView(VIEWS.INPUT);
     } finally {
@@ -509,9 +538,7 @@ function App() {
                   <div
                     key={idx}
                     className={`chat-bubble p-3 rounded-lg text-xs mb-2 ${
-                      isUser
-                        ? "self-end text-right bg-indigo-600/30"
-                        : "self-start text-left bg-slate-700/50"
+                      isUser ? "self-end text-right bg-indigo-600/30" : "self-start text-left bg-slate-700/50"
                     }`}
                   >
                     {log.text}
