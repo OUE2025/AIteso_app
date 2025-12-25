@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 const CONFIG = {
   geminiModel: "gemini-2.5-flash-preview-09-2025",
-  imagenModel: "imagen-4.0-generate-001",
+  imagenModel: "imagen-4.0-fast-generate-001",
   apiBase: "https://generativelanguage.googleapis.com/v1beta/models/",
   maxImageDimension: 1600,
 };
@@ -88,49 +88,67 @@ function ensureApiKey() {
   return apiKey;
 }
 
-async function secureApiCall(payload, endpoint = "generateContent") {
+async function secureApiCall(payload, endpoint = "generateContent", retries, delay = 2000, options = {}) {
+  const { onQuota } = options;
   const key = ensureApiKey();
   const isPredict = endpoint === "predict";
   const model = isPredict ? CONFIG.imagenModel : CONFIG.geminiModel;
   const url = `${CONFIG.apiBase}${model}:${endpoint}?key=${key}`;
+  const remainingRetries = typeof retries === "number" ? retries : isPredict ? 0 : 2;
 
-  let retryCount = 0;
-  const maxRetries = 5;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
-  while (retryCount < maxRetries) {
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const rawMessage = errorData.error?.message || `HTTP ${response.status}`;
+      const lower = rawMessage.toLowerCase();
+      const status = response.status;
+      const isQuota =
+        status === 429 ||
+        status === 403 ||
+        lower.includes("quota") ||
+        lower.includes("exceed") ||
+        lower.includes("exhausted") ||
+        lower.includes("insufficient tokens") ||
+        lower.includes("billing") ||
+        lower.includes("billed users") ||
+        lower.includes("daily limit");
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        const rawMessage = errorData.error?.message || `HTTP ${response.status}`;
-        const lower = rawMessage.toLowerCase();
-        const status = response.status;
-        const isQuota =
-          status === 429 ||
-          status === 403 ||
-          lower.includes("quota") ||
-          lower.includes("exceed") ||
-          lower.includes("exhausted") ||
-          lower.includes("insufficient tokens") ||
-          lower.includes("billing") ||
-          lower.includes("daily limit");
-        if (isQuota) {
-          throw new Error("無料枠を使い切ったため、本日はご利用いただけません。明日以降か、課金設定後にお試しください。");
-        }
-        throw new Error(rawMessage);
+      // 429は指数バックオフでリトライ
+      if (status === 429 && remainingRetries > 0) {
+        await new Promise((res) => setTimeout(res, delay));
+        return secureApiCall(payload, endpoint, remainingRetries - 1, delay * 2, options);
       }
 
-      return await response.json();
-    } catch (error) {
-      retryCount += 1;
-      if (retryCount >= maxRetries) throw error;
-      await new Promise((res) => setTimeout(res, Math.pow(2, retryCount) * 1000));
+      // その他のエラーはモーダルを出して中断
+      if (isQuota) {
+        onQuota?.();
+        throw new Error("無料枠を使い切ったため、本日はご利用いただけません。明日以降か、課金設定後にお試しください。");
+      }
+      const isBillingRequired =
+        lower.includes("billed users") ||
+        lower.includes("billing account") ||
+        lower.includes("billing required") ||
+        lower.includes("enable billing");
+      if (isBillingRequired) {
+        throw new Error("Imagenは現在有料アカウント専用です。Google AI Studioで課金設定を有効にすると精霊生成が利用できます。");
+      }
+      throw new Error(rawMessage);
     }
+
+    return await response.json();
+  } catch (error) {
+    // ネットワーク例外などで429以外でもリトライしたい場合はここで拾う
+    if (!isPredict && remainingRetries > 0 && error?.status === 429) {
+      await new Promise((res) => setTimeout(res, delay));
+      return secureApiCall(payload, endpoint, remainingRetries - 1, delay * 2, options);
+    }
+    throw error;
   }
 }
 
@@ -150,6 +168,10 @@ function App() {
   const [chatInput, setChatInput] = useState("");
   const [toast, setToast] = useState("");
   const [dropActive, setDropActive] = useState(false);
+  const [quotaModal, setQuotaModal] = useState(false);
+  const [promptInput, setPromptInput] = useState("");
+  const [promptImage, setPromptImage] = useState("");
+  const [promptLoading, setPromptLoading] = useState(false);
 
   const displayName = useMemo(() => userName.trim() || "あなた", [userName]);
 
@@ -189,6 +211,35 @@ function App() {
     handleImageSelection(file);
   };
 
+  const generatePromptImage = async () => {
+    const prompt = promptInput.trim();
+    if (!prompt) {
+      showToast("画像の指示テキストを入力してください");
+      return;
+    }
+    setPromptLoading(true);
+    setPromptImage("");
+    try {
+      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&seed=${Date.now()}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("画像生成に失敗しました");
+      const blob = await res.blob();
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+      setPromptImage(dataUrl);
+    } catch (error) {
+      console.error("Prompt Image Error:", error);
+      showToast(error?.message || "画像生成に失敗しました");
+    } finally {
+      setPromptLoading(false);
+    }
+  };
+
+
   const startAnalysis = async () => {
     if (!imageData || isProcessing) {
       showToast("手のひらの画像をアップロードしてください");
@@ -209,16 +260,22 @@ function App() {
 鑑定結果の文中で必ず「${displayName}さん」と呼びかけてください。`;
 
     try {
-      const response = await secureApiCall({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: imageMime, data: imageData } },
-            ],
-          },
-        ],
-      });
+      const response = await secureApiCall(
+        {
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                { inlineData: { mimeType: imageMime, data: imageData } },
+              ],
+            },
+          ],
+        },
+        "generateContent",
+        undefined,
+        undefined,
+        { onQuota: () => setQuotaModal(true) }
+      );
 
       const content = response?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!content) throw new Error("解析結果が得られませんでした");
@@ -229,62 +286,97 @@ function App() {
     } catch (error) {
       console.error("Analysis Error:", error);
       setAnalysisMarkdown("");
-      showToast(error.message || "鑑定に失敗しました。時間をおいて再試行してください。");
+      const msg = error?.message || "";
+      const lower = msg.toLowerCase();
+      const isQuota =
+        lower.includes("無料枠を使い切った") ||
+        lower.includes("quota") ||
+        lower.includes("exceed") ||
+        lower.includes("exhausted") ||
+        lower.includes("insufficient tokens") ||
+        lower.includes("billing") ||
+        lower.includes("billed users") ||
+        lower.includes("daily limit");
+      if (isQuota) {
+        setQuotaModal(true);
+      }
+      showToast(msg || "鑑定に失敗しました。時間をおいて再試行してください。");
       setView(VIEWS.INPUT);
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const handleSummonSpirit = async () => {
+  const handleSummonSpirit = () => {
     if (!analysisMarkdown) {
       showToast("先に鑑定を完了してください");
       return;
     }
+    generateSpirit();
+  };
 
+  const fetchFallbackImage = async (prompt) => {
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+      `Mystical ethereal fantasy spirit, ${prompt}, detailed spiritual digital art, cinematic lighting`
+    )}?width=1024&height=1024&nologo=true&seed=${Date.now()}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("代替画像サービスでも生成に失敗しました");
+    const blob = await res.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  };
+
+  const generateSpirit = async () => {
+    if (!analysisMarkdown) {
+      showToast("先に鑑定を完了してください");
+      return;
+    }
     setSpiritState({ status: "loading", img: "", caption: "" });
 
+    let promptText = "";
+    let spiritName = "精霊";
+
     try {
-      const promptRes = await secureApiCall({
-        contents: [
-          {
-            parts: [
-              {
-                text: `以下の手相鑑定結果から${displayName}さんの魂を象徴する幻想的な守護精霊を1体定義し、Imagen 4.0用英語プロンプトと和名をカッコ内に。結果：${analysisMarkdown.substring(
-                  0,
-                  1000
-                )}`,
-              },
-            ],
-          },
-        ],
-      });
-
-      const raw = promptRes?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const prompt = raw.split("(")[0].trim();
-      const spiritName = raw.match(/\((.*?)\)/)?.[1] || "精霊";
-
-      const imageRes = await secureApiCall(
+      const promptRes = await secureApiCall(
         {
-          instances: {
-            prompt: `Mystical ethereal fantasy spirit, ${prompt}, detailed spiritual digital art, cinematic lighting, ultra high resolution`,
-          },
-          parameters: { sampleCount: 1 },
+          contents: [
+            {
+              parts: [
+                {
+                  text: `以下の手相鑑定結果から${displayName}さんの魂を象徴する幻想的な守護精霊を1体定義し、Imagen 4.0用英語プロンプトと和名をカッコ内に。結果：${analysisMarkdown.substring(
+                    0,
+                    1000
+                  )}`,
+                },
+              ],
+            },
+          ],
         },
-        "predict"
+        "generateContent",
+        undefined,
+        undefined,
+        { onQuota: () => setQuotaModal(true) }
       );
 
-      const base64 = imageRes?.predictions?.[0]?.bytesBase64Encoded;
-      if (!base64) throw new Error("画像生成に失敗しました");
+      const raw = promptRes?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      promptText = raw.split("(")[0].trim();
+      spiritName = raw.match(/\((.*?)\)/)?.[1] || "精霊";
+
+      const fallbackImg = await fetchFallbackImage(promptText || analysisMarkdown.substring(0, 200));
 
       setSpiritState({
         status: "done",
-        img: `data:image/png;base64,${base64}`,
+        img: fallbackImg,
         caption: `召喚された精霊：${spiritName}`,
       });
     } catch (error) {
       console.error("Summon Error:", error);
-      showToast("精霊の召喚に失敗しました");
+      const msg = error?.message || "";
+      showToast(msg || "精霊の召喚に失敗しました");
       setSpiritState({ status: "idle", img: "", caption: "" });
     }
   };
@@ -299,14 +391,20 @@ function App() {
     setChatInput("");
 
     try {
-      const response = await secureApiCall({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: `手相鑑定結果：\n${analysisMarkdown}\n\n質問：${query}` }],
-          },
-        ],
-      });
+      const response = await secureApiCall(
+        {
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `手相鑑定結果：\n${analysisMarkdown}\n\n質問：${query}` }],
+            },
+          ],
+        },
+        "generateContent",
+        undefined,
+        undefined,
+        { onQuota: () => setQuotaModal(true) }
+      );
       const answer = response?.candidates?.[0]?.content?.parts?.[0]?.text || "お答えを生成できませんでした。";
       setChatLogs((logs) => [...logs.slice(0, -1), { sender: "bot", text: answer }]);
     } catch (error) {
@@ -336,6 +434,10 @@ function App() {
     setChatInput("");
     setView(VIEWS.INPUT);
     setIsProcessing(false);
+    setQuotaModal(false);
+    setPromptInput("");
+    setPromptImage("");
+    setPromptLoading(false);
   };
 
   return (
@@ -458,6 +560,34 @@ function App() {
                 </button>
               </div>
             )}
+          </div>
+          <div className="glass-card p-6 md:p-8 shadow-2xl space-y-4 text-left">
+            <h3 className="text-lg font-bold text-white">Pollinationsで画像生成（テキスト指示）</h3>
+            <p className="text-sm text-slate-300">指示テキストを入力して画像を生成します。（テスト用・後で削除可能）</p>
+            <input
+              type="text"
+              value={promptInput}
+              onChange={(e) => setPromptInput(e.target.value)}
+              placeholder="例: 夜明けの森にいる青い小鳥、映画のようなライティング"
+              className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+            <div className="flex flex-col md:flex-row md:items-center gap-4">
+              <button
+                type="button"
+                onClick={generatePromptImage}
+                disabled={promptLoading}
+                className="px-5 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-white font-bold shadow-lg disabled:opacity-60"
+              >
+                {promptLoading ? "生成中..." : "画像を生成する"}
+              </button>
+              {promptImage && (
+                <img
+                  src={promptImage}
+                  alt="Prompt generated"
+                  className="w-full md:w-48 rounded-xl border border-white/10 shadow-lg"
+                />
+              )}
+            </div>
           </div>
         </section>
       )}
@@ -620,6 +750,25 @@ function App() {
           {toast}
         </div>
       )}
+
+      {quotaModal && (
+        <div className="modal-overlay z-[500]">
+          <div className="glass-card max-w-md w-full p-6 md:p-8 space-y-4 shadow-2xl">
+            <h3 className="text-xl font-bold text-white text-center mb-2">ご利用制限について</h3>
+            <p className="text-sm text-slate-300 text-center leading-relaxed">
+              無料枠を使い切ったため、本日はご利用いただけません。明日以降か、課金設定後にお試しください。
+            </p>
+            <button
+              type="button"
+              onClick={() => setQuotaModal(false)}
+              className="w-full py-3 rounded-xl bg-indigo-600 text-white font-bold shadow-lg hover:opacity-90"
+            >
+              閉じる
+            </button>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
